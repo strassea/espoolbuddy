@@ -100,6 +100,13 @@ class BambuddyNFCComponent
   // RF field off and idles — used for "NFC in sleep: Off" (max power saving, no
   // local-reader wake). Re-enabled on wake.
   void set_scan_enabled(bool v) { scan_enabled_ = v; }
+  // True once pn532_init() has succeeded and the reader is answering.
+  //
+  // Read this, not DisplayState::nfc_ok — bambuddy_api sets that field to true
+  // on every successful heartbeat (and hard-codes "nfc_ok":true in the payload
+  // it sends), so it reports backend connectivity, not reader health. A dead
+  // PN532 shows up there as healthy within 10 s of dying.
+  bool nfc_ok() const { return nfc_ok_; }
 
  protected:
   // ---- Background polling task ----
