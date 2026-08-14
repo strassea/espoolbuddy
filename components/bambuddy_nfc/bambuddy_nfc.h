@@ -215,6 +215,9 @@ class BambuddyNFCComponent
                    uint8_t out[32]);
 
   // ---- UUID extraction ----
+  // Decode the filament metadata the tag carries, for spool registration.
+  static bambuddy_api::BambuTagInfo parse_bambu_tag(
+      const std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> &blocks);
   static std::string extract_tray_uuid(
       const std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> &blocks);
 
