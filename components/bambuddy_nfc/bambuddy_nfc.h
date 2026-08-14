@@ -118,6 +118,11 @@ class BambuddyNFCComponent
   // it sends), so it reports backend connectivity, not reader health. A dead
   // PN532 shows up there as healthy within 10 s of dying.
   bool nfc_ok() const { return nfc_ok_; }
+  // Ask the poll task to re-run the PN532 handshake. Safe to call from any
+  // task: it only sets a flag, which the poll loop services between commands.
+  // Never call pn532_init()/setup() directly from outside — they drive SPI and
+  // would race the poll task on the other core.
+  void request_reinit() { reinit_requested_ = true; }
 
  protected:
   // ---- Background polling task ----
@@ -155,6 +160,7 @@ class BambuddyNFCComponent
   // the reader has gone deaf, so "no tag" and "no reader" stop being the same
   // observation.
   bool pn532_probe_alive();
+  std::atomic<bool> reinit_requested_{false};
   uint32_t last_probe_ms_{0};
   uint8_t probe_fail_streak_{0};
   static constexpr uint32_t PROBE_INTERVAL_MS = 30000;

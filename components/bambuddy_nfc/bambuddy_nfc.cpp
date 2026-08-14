@@ -628,7 +628,23 @@ bool BambuddyNFCComponent::pn532_probe_alive() {
   std::vector<uint8_t> resp;
   // Short timeout on purpose: this command is answered from firmware with no
   // RF involvement, so a healthy PN532 replies in single-digit milliseconds.
-  return pn532_send_receive(cmd, resp, 100) && resp.size() >= 4;
+  if (!pn532_send_receive(cmd, resp, 100)) {
+    ESP_LOGW(NFC_TAG, "Liveness: no response to GetFirmwareVersion");
+    return false;
+  }
+  // Check the opcode, not just that bytes arrived. This probe exists to detect
+  // a desynchronised command stream, and a length check cannot: if responses
+  // are offset by one frame, some *other* command's reply satisfies "at least
+  // 4 bytes" and the probe passes while the reader is effectively deaf.
+  // Requiring CMD+1 means passing the probe proves the stream is aligned.
+  if (resp.size() < 4 || resp[0] != (PN532_CMD_GETFIRMWAREVERSION + 1)) {
+    ESP_LOGW(NFC_TAG,
+             "Liveness: desynced reply — got %u bytes, opcode 0x%02X, want 0x%02X",
+             (unsigned) resp.size(), resp.empty() ? 0 : resp[0],
+             PN532_CMD_GETFIRMWAREVERSION + 1);
+    return false;
+  }
+  return true;
 }
 
 void BambuddyNFCComponent::poll_task_loop() {
@@ -640,6 +656,24 @@ void BambuddyNFCComponent::poll_task_loop() {
       vTaskDelay(pdMS_TO_TICKS(250));
       continue;
     }
+    // Externally requested re-init. Performed here, in the poll task, rather
+    // than by the caller: pn532_init() drives the SPI bus, and the poll task
+    // may be mid-command on the other core. A flag serviced at a known-safe
+    // point is the only race-free way to offer this from a button or an
+    // automation.
+    if (reinit_requested_.exchange(false)) {
+      ESP_LOGW(NFC_TAG, "Re-init requested — reinitialising PN532");
+      bool ok = pn532_init();
+      nfc_ok_ = ok;
+      if (api_) api_->set_nfc_ok(ok);
+      probe_fail_streak_ = 0;
+      state_ = NFCState::IDLE;
+      miss_count_ = 0;
+      current_uid_.clear();
+      current_sak_ = 0;
+      ESP_LOGW(NFC_TAG, "Requested re-init %s", ok ? "succeeded" : "FAILED");
+    }
+
     poll_once();
 
     // Liveness. Only while no tag is on the reader: mid-transaction (auth,
