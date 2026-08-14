@@ -160,6 +160,13 @@ class BambuddyNFCComponent
   // the reader has gone deaf, so "no tag" and "no reader" stop being the same
   // observation.
   bool pn532_probe_alive();
+  // Re-send SAMConfiguration without the full init handshake. The PN532 can
+  // reach a state where GetFirmwareVersion still answers correctly but
+  // InListPassiveTarget stops finding any target — observed in the field, and
+  // cleared instantly by pn532_init(). SAMConfiguration is the only part of
+  // init that touches the RF/target configuration, so refreshing it on the
+  // idle path keeps the reader from silently going deaf.
+  bool pn532_sam_configure();
   std::atomic<bool> reinit_requested_{false};
   uint32_t last_probe_ms_{0};
   uint8_t probe_fail_streak_{0};

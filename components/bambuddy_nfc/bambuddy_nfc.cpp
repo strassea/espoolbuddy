@@ -623,6 +623,15 @@ void BambuddyNFCComponent::poll_task_trampoline(void *arg) {
   static_cast<BambuddyNFCComponent *>(arg)->poll_task_loop();
 }
 
+bool BambuddyNFCComponent::pn532_sam_configure() {
+  // SAMConfiguration on its own — no wakeup, no delays. Re-sending it puts the
+  // RF/target state machine back into a known normal mode in ~10 ms.
+  const uint8_t use_irq = (irq_pin_ != nullptr) ? 0x01 : 0x00;
+  std::vector<uint8_t> cmd = {PN532_CMD_SAMCONFIGURATION, 0x01, 0x0A, use_irq};
+  std::vector<uint8_t> resp;
+  return pn532_send_receive(cmd, resp, 200);
+}
+
 bool BambuddyNFCComponent::pn532_probe_alive() {
   std::vector<uint8_t> cmd = {PN532_CMD_GETFIRMWAREVERSION};
   std::vector<uint8_t> resp;
@@ -691,7 +700,7 @@ void BambuddyNFCComponent::poll_task_loop() {
         if (api_) api_->set_nfc_ok(ok);
         ESP_LOGW(NFC_TAG, "PN532 recovery init %s", ok ? "succeeded" : "failed");
         if (ok) probe_fail_streak_ = 0;
-      } else if (pn532_probe_alive()) {
+      } else if (pn532_sam_configure() && pn532_probe_alive()) {
         if (probe_fail_streak_ > 0) {
           ESP_LOGI(NFC_TAG, "PN532 answering again after %u failed probe(s)",
                    (unsigned) probe_fail_streak_);
@@ -699,7 +708,7 @@ void BambuddyNFCComponent::poll_task_loop() {
         }
       } else {
         probe_fail_streak_++;
-        ESP_LOGW(NFC_TAG, "PN532 liveness probe failed (%u/%u)",
+        ESP_LOGW(NFC_TAG, "PN532 liveness/refresh failed (%u/%u)",
                  (unsigned) probe_fail_streak_,
                  (unsigned) PROBE_FAILS_BEFORE_REINIT);
         if (probe_fail_streak_ >= PROBE_FAILS_BEFORE_REINIT) {
