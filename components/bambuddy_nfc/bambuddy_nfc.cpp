@@ -130,6 +130,13 @@ bool BambuddyNFCComponent::pn532_wait_irq_released(uint32_t timeout_ms) {
   return false;
 }
 
+void BambuddyNFCComponent::pn532_release_target() {
+  // Tg = 0x00 releases every activated target.
+  std::vector<uint8_t> cmd = {PN532_CMD_INRELEASE, 0x00};
+  std::vector<uint8_t> resp;
+  pn532_send_receive(cmd, resp, 100);
+}
+
 void BambuddyNFCComponent::pn532_send_ack() {
   // ACK frame: 00 00 FF 00 FF 00
   static const uint8_t ack[6] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
@@ -1028,6 +1035,14 @@ void BambuddyNFCComponent::poll_once() {
       // backend's heartbeat response.
       attempt_pending_write(current_uid_, current_sak_);
     }
+
+    // Hand the card back before the next poll. InListPassiveTarget activates a
+    // target and MIFARE auth leaves it that way; per ISO 14443-3 an ACTIVE card
+    // no longer answers REQA/WUPA, so the very next detect finds nothing and
+    // the tag is declared removed while it is still physically on the reader —
+    // exactly the observed "Tag removed" one second after a successful read.
+    // InRelease returns it to HALT, where the PN532's WUPA finds it again.
+    pn532_release_target();
 
   } else {
     // No tag detected

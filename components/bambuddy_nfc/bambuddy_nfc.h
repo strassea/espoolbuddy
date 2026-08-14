@@ -35,6 +35,7 @@ static constexpr uint8_t PN532_CMD_SAMCONFIGURATION  = 0x14;
 static constexpr uint8_t PN532_CMD_INLISTPASSIVETARGET = 0x4A;
 static constexpr uint8_t PN532_CMD_INDATAEXCHANGE    = 0x40;
 static constexpr uint8_t PN532_CMD_GETFIRMWAREVERSION = 0x02;
+static constexpr uint8_t PN532_CMD_INRELEASE         = 0x52;
 
 // MIFARE commands
 static constexpr uint8_t MFC_AUTH_KEY_A  = 0x60;
@@ -150,6 +151,11 @@ class BambuddyNFCComponent
   // host to cancel a command the PN532 is still executing. Needed because
   // InListPassiveTarget has no timeout and otherwise runs until a tag appears.
   void pn532_send_ack();
+  // Release the activated target so it returns to HALT and can be found again.
+  // ISO 14443-3: a card left ACTIVE (selected) ignores REQA/WUPA, so without
+  // this the tag we just read becomes undetectable while still sitting on the
+  // reader — and gets reported as removed.
+  void pn532_release_target();
   bool pn532_read_response(std::vector<uint8_t> &resp, uint32_t timeout_ms = 100);
   bool pn532_send_receive(const std::vector<uint8_t> &cmd,
                           std::vector<uint8_t> &resp,
