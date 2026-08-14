@@ -260,6 +260,27 @@ bool BambuddyNFCComponent::pn532_init() {
   do_wakeup();
   delay(100);  // allow PN532 oscillator startup and internal reset to complete
 
+  // Raw status-register bytes, before any command. This is the cheapest way to
+  // tell a wiring fault from a dead module, and worth logging because a failed
+  // init otherwise says only "no answer":
+  //   all 0x00 — MISO reading low: broken/disconnected MISO, or the PN532 is
+  //              not powered/driving at all
+  //   all 0xFF — MISO floating high: MISO disconnected, or CS never reaching
+  //              the module so it stays tri-stated
+  //   0x01     — PN532_READY, the reader is answering
+  //   varying  — SPI is alive; the PN532 simply is not ready
+  // If these are constant, no amount of driver work will help — check the wire.
+  {
+    uint8_t s0 = 0, s1 = 0, s2 = 0;
+    pn532_spi_read_status(s0);
+    delay(2);
+    pn532_spi_read_status(s1);
+    delay(2);
+    pn532_spi_read_status(s2);
+    ESP_LOGI(NFC_TAG, "PN532 status register reads: 0x%02X 0x%02X 0x%02X",
+             s0, s1, s2);
+  }
+
   // After an ESP32 reset mid-transaction the PN532 may still assert "ready".
   // Flush any such stale state so it is not mistaken for a command ACK.
   {
