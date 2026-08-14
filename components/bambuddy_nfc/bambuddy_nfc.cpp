@@ -115,6 +115,31 @@ bool BambuddyNFCComponent::pn532_wait_ready(uint32_t timeout_ms) {
   return false;
 }
 
+bool BambuddyNFCComponent::pn532_wait_irq_released(uint32_t timeout_ms) {
+  // Only meaningful in IRQ mode. The PN532 drives IRQ LOW when a frame is
+  // waiting and releases it once we have read that frame — but not
+  // instantaneously. Without this, the wait_ready() that follows a read can see
+  // the *previous* frame's still-asserted IRQ, return immediately, and read a
+  // response that does not exist yet.
+  if (irq_pin_ == nullptr) return true;
+  uint32_t deadline = millis() + timeout_ms;
+  while (millis() < deadline) {
+    if (irq_pin_->digital_read()) return true;  // HIGH = released
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  return false;
+}
+
+void BambuddyNFCComponent::pn532_send_ack() {
+  // ACK frame: 00 00 FF 00 FF 00
+  static const uint8_t ack[6] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
+  this->enable();
+  delay(2);  // CS setup time before first clock edge
+  this->write_byte(PN532_SPI_DATAWRITE);
+  this->write_array(ack, sizeof(ack));
+  this->disable();
+}
+
 bool BambuddyNFCComponent::pn532_write_command(
     const std::vector<uint8_t> &cmd) {
   // Frame: PREAMBLE START1 START2 LEN LCS TFI cmd... DCS POSTAMBLE
@@ -146,7 +171,22 @@ bool BambuddyNFCComponent::pn532_write_command(
 
 bool BambuddyNFCComponent::pn532_read_response(std::vector<uint8_t> &resp,
                                                 uint32_t timeout_ms) {
-  if (!pn532_wait_ready(timeout_ms)) return false;
+  if (!pn532_wait_ready(timeout_ms)) {
+    // The command is still executing inside the PN532 — we are giving up on it,
+    // it is not. InListPassiveTarget in particular has no timeout at all and
+    // will keep scanning indefinitely (UM10232 §7.3.5): the SAMConfiguration
+    // timeout byte bounds virtual-card mode only, not this.
+    //
+    // Returning here without cancelling leaves that command in flight, and the
+    // next poll writes a fresh command on top of it. The PN532 then answers the
+    // *older* command, the host reads that answer as the new command's ACK, and
+    // every subsequent exchange is off by one — permanently, with no error
+    // anywhere, because a desynced read looks exactly like "no tag found".
+    //
+    // An ACK frame from the host is the documented way to cancel (§7.1.1.1).
+    pn532_send_ack();
+    return false;
+  }
 
   // The PN532 SPI state machine resets on every /SS de-assertion, so the
   // entire response frame — header and body — must be read within a SINGLE
@@ -189,9 +229,18 @@ bool BambuddyNFCComponent::pn532_send_receive(const std::vector<uint8_t> &cmd,
   // Wait for the PN532 to assert the ready flag before reading the ACK.
   // Use 100ms here — 50ms was marginal during cold-boot when the PN532
   // oscillator is still stabilising and the first command takes longer.
-  if (!pn532_wait_ready(100)) return false;
+  if (!pn532_wait_ready(100)) {
+    // No ACK: either the command never landed, or a previous one is still
+    // running and the PN532 is ignoring us. Cancel before giving up, so we do
+    // not leave a command in flight for the next call to trip over.
+    pn532_send_ack();
+    return false;
+  }
   uint8_t ack[6];
   if (!pn532_spi_read_data(ack, sizeof(ack))) return false;
+  // Let the PN532 release IRQ after the ACK frame, so the response wait below
+  // blocks on the *response* rather than returning instantly on a stale LOW.
+  pn532_wait_irq_released();
   return pn532_read_response(resp, timeout_ms);
 }
 
@@ -433,16 +482,18 @@ void BambuddyNFCComponent::setup() {
   arch_feed_wdt();
   delay(200);
 
-  if (!pn532_init()) {
-    ESP_LOGE(NFC_TAG, "PN532 init failed — NFC will be unavailable");
-    nfc_ok_ = false;
-    if (api_) api_->set_nfc_ok(false);
-    return;
+  // A failed init is no longer terminal. The task still starts, poll_once()
+  // no-ops while nfc_ok_ is false, and the recovery path in poll_task_loop()
+  // retries the handshake — so a PN532 that is merely slow to wake, or briefly
+  // starved while WiFi and the RF field come up together, recovers on its own
+  // instead of staying dead and silent until someone power-cycles the board.
+  nfc_ok_ = pn532_init();
+  if (api_) api_->set_nfc_ok(nfc_ok_);
+  if (nfc_ok_) {
+    ESP_LOGI(NFC_TAG, "PN532 initialized");
+  } else {
+    ESP_LOGE(NFC_TAG, "PN532 init failed — will keep retrying in the poll task");
   }
-
-  nfc_ok_ = true;
-  if (api_) api_->set_nfc_ok(true);
-  ESP_LOGI(NFC_TAG, "PN532 initialized");
 
   // Spawn the polling task on core 1 (the main loop / LVGL run on core 0), so
   // the PN532's busy-wait handshakes run in parallel and never stall the UI.
@@ -451,6 +502,16 @@ void BambuddyNFCComponent::setup() {
   // left too little margin: a wild-PC interrupt-WDT crash on core 1 pointed at
   // stack corruption.  The poll loop logs its high-water mark periodically so
   // the remaining headroom stays visible.
+  // setup() is re-runnable: a config that retries a failed init (or a UI button
+  // that does) must not end up with two tasks polling the same SPI bus, which
+  // is silent corruption rather than an obvious failure. Creating the task is
+  // therefore conditional on not already having one; everything above it is
+  // idempotent.
+  if (poll_task_handle_ != nullptr) {
+    ESP_LOGI(NFC_TAG, "NFC polling task already running — reusing it");
+    return;
+  }
+
   xTaskCreatePinnedToCore(&BambuddyNFCComponent::poll_task_trampoline,
                           "bambuddy_nfc", 8192, this,
                           4 /* priority */, &poll_task_handle_, 1 /* core */);
@@ -465,6 +526,14 @@ void BambuddyNFCComponent::poll_task_trampoline(void *arg) {
   static_cast<BambuddyNFCComponent *>(arg)->poll_task_loop();
 }
 
+bool BambuddyNFCComponent::pn532_probe_alive() {
+  std::vector<uint8_t> cmd = {PN532_CMD_GETFIRMWAREVERSION};
+  std::vector<uint8_t> resp;
+  // Short timeout on purpose: this command is answered from firmware with no
+  // RF involvement, so a healthy PN532 replies in single-digit milliseconds.
+  return pn532_send_receive(cmd, resp, 100) && resp.size() >= 4;
+}
+
 void BambuddyNFCComponent::poll_task_loop() {
   uint32_t last_stack_diag_ms = 0;
   for (;;) {
@@ -475,6 +544,54 @@ void BambuddyNFCComponent::poll_task_loop() {
       continue;
     }
     poll_once();
+
+    // Liveness. Only while no tag is on the reader: mid-transaction (auth,
+    // block reads, a pending write) an extra command would disturb the
+    // exchange, and a working transaction is its own proof of life.
+    if (state_ == NFCState::IDLE &&
+        (millis() - last_probe_ms_) >= PROBE_INTERVAL_MS) {
+      last_probe_ms_ = millis();
+
+      if (!nfc_ok_) {
+        // Already known down (failed init at boot, or a re-init that did not
+        // take). No point probing — go straight to the handshake.
+        bool ok = pn532_init();
+        nfc_ok_ = ok;
+        if (api_) api_->set_nfc_ok(ok);
+        ESP_LOGW(NFC_TAG, "PN532 recovery init %s", ok ? "succeeded" : "failed");
+        if (ok) probe_fail_streak_ = 0;
+      } else if (pn532_probe_alive()) {
+        if (probe_fail_streak_ > 0) {
+          ESP_LOGI(NFC_TAG, "PN532 answering again after %u failed probe(s)",
+                   (unsigned) probe_fail_streak_);
+          probe_fail_streak_ = 0;
+        }
+      } else {
+        probe_fail_streak_++;
+        ESP_LOGW(NFC_TAG, "PN532 liveness probe failed (%u/%u)",
+                 (unsigned) probe_fail_streak_,
+                 (unsigned) PROBE_FAILS_BEFORE_REINIT);
+        if (probe_fail_streak_ >= PROBE_FAILS_BEFORE_REINIT) {
+          ESP_LOGE(NFC_TAG, "PN532 unresponsive — re-initialising");
+          if (api_) api_->set_nfc_ok(false);
+          // pn532_init() only re-runs the wakeup + SAMConfiguration handshake;
+          // unlike setup() it starts no task, so calling it from this task is
+          // safe and cannot duplicate the poll loop.
+          bool ok = pn532_init();
+          nfc_ok_ = ok;
+          if (api_) api_->set_nfc_ok(ok);
+          ESP_LOGW(NFC_TAG, "PN532 re-init %s", ok ? "succeeded" : "FAILED");
+          if (ok) {
+            probe_fail_streak_ = 0;
+            state_ = NFCState::IDLE;
+            miss_count_ = 0;
+            current_uid_.clear();
+            current_sak_ = 0;
+          }
+        }
+      }
+    }
+
     // Stack-headroom diagnostic (every 5 min): high-water mark is the minimum
     // free stack ever seen, in StackType_t words.  If this trends toward zero
     // the task is the prime suspect for wild-PC / int-WDT crashes on core 1.

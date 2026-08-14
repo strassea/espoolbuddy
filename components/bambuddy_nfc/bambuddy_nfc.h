@@ -116,11 +116,31 @@ class BambuddyNFCComponent
   bool pn532_spi_read_status(uint8_t &status);
   bool pn532_spi_read_data(uint8_t *data, size_t len);
   bool pn532_wait_ready(uint32_t timeout_ms = 100);
+  // Wait for the PN532 to release IRQ (drive it back HIGH) after we have read a
+  // frame. Bounded and advisory: returns false on timeout but callers continue,
+  // so this can only ever cost latency, never functionality.
+  bool pn532_wait_irq_released(uint32_t timeout_ms = 20);
   bool pn532_write_command(const std::vector<uint8_t> &cmd);
+  // Send a host ACK frame. UM10232 §7.1.1.1: this is the *only* way for the
+  // host to cancel a command the PN532 is still executing. Needed because
+  // InListPassiveTarget has no timeout and otherwise runs until a tag appears.
+  void pn532_send_ack();
   bool pn532_read_response(std::vector<uint8_t> &resp, uint32_t timeout_ms = 100);
   bool pn532_send_receive(const std::vector<uint8_t> &cmd,
                           std::vector<uint8_t> &resp,
                           uint32_t timeout_ms = 200);
+
+  // ---- Liveness ----
+  // A tagless InListPassiveTarget legitimately times out every poll, so detect
+  // failures say nothing about the link. GetFirmwareVersion does: it must
+  // answer immediately. Run it periodically and use *its* failures to decide
+  // the reader has gone deaf, so "no tag" and "no reader" stop being the same
+  // observation.
+  bool pn532_probe_alive();
+  uint32_t last_probe_ms_{0};
+  uint8_t probe_fail_streak_{0};
+  static constexpr uint32_t PROBE_INTERVAL_MS = 30000;
+  static constexpr uint8_t PROBE_FAILS_BEFORE_REINIT = 3;
 
   // ---- PN532 high-level ----
   bool pn532_init();
