@@ -77,6 +77,24 @@ enum class TagSource {
 };
 
 /** Filament information decoded from NFC tag / backend response */
+/** Filament metadata decoded from a Bambu Lab tag's own data blocks.
+ *
+ * Bambuddy populates a spool's material/colour from the *printer's* AMS MQTT
+ * report, so a spool the printer has never loaded has none. The reader has
+ * already decrypted all of it off the tag, so carrying it here lets
+ * create_spool_from_tag() register a complete spool instead of a stub.
+ */
+struct BambuTagInfo {
+  bool valid = false;
+  std::string material;    // block 2, "PLA"
+  std::string subtype;     // block 4 minus the material, "Basic"
+  std::string rgba;        // block 5, 8 hex chars "FFFFFFFF"
+  std::string tray_uuid;   // block 9
+  int label_weight = 0;    // block 5, grams
+  int nozzle_min = 0;      // block 6
+  int nozzle_max = 0;      // block 6
+};
+
 struct FilamentInfo {
   std::string tray_uuid;
   std::string material_type;  // "PLA"
@@ -391,6 +409,14 @@ class BambuddyAPIComponent : public Component {
   DisplayState snapshot();
 
   // Thread-safe setter for the NFC health flag (called from the NFC task).
+  // Latest Bambu tag metadata, set by the NFC component right before
+  // on_tag_scanned(). Consumed by create_spool_from_tag().
+  void set_bambu_tag_info(const BambuTagInfo &info) {
+    lock_state();
+    last_bambu_tag_ = info;
+    unlock_state();
+  }
+
   void set_nfc_ok(bool ok) {
     lock_state();
     display_state_.nfc_ok = ok;
@@ -681,6 +707,7 @@ class BambuddyAPIComponent : public Component {
   std::string backend_url_;
   std::string api_key_;
   std::string device_id_;
+  BambuTagInfo last_bambu_tag_;  // guarded by the state mutex
   std::string hostname_{"SpoolBuddy-ESP"};
   uint32_t heartbeat_interval_ms_{10000};
   uint32_t scale_report_interval_ms_{1000};

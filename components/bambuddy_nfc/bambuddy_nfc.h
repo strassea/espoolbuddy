@@ -58,7 +58,9 @@ static const uint8_t BAMBU_CONTEXT[7] = {
 //   2 = Filament Type ("PLA")
 //   4 = Detailed Filament Type ("PLA Basic")
 //   5 = RGBA colour + spool weight + filament diameter
-static const uint8_t BAMBU_BLOCKS[] = {1, 2, 4, 5};
+//   6 = drying/bed temps + hotend max/min (same sector as 4 and 5, so it
+//       costs no extra MIFARE authentication)
+static const uint8_t BAMBU_BLOCKS[] = {1, 2, 4, 5, 6};
 
 // Block 9 holds the 16-byte Tray UID — the value Bambu printers report as
 // tray_uuid and the only field on the tag that uniquely identifies a spool.

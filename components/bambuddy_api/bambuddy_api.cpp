@@ -3646,19 +3646,50 @@ void BambuddyAPIComponent::api_link_tag(int spool_id, const std::string &uid,
 void BambuddyAPIComponent::api_create_spool_from_tag(const std::string &uid) {
   std::string resp;
   bool ok;
+  // Use what the tag itself told us rather than a hardcoded stub. Bambuddy
+  // fills a spool's material and colour from the *printer's* AMS report, so a
+  // spool the printer has never loaded gets none — and posting
+  // material:"PLA", label_weight:1000 for every spool is actively wrong for
+  // anything that is not 1 kg of PLA. The reader has already decrypted the
+  // real values off the tag; carry them into the create call.
+  BambuTagInfo tag;
+  lock_state();
+  tag = last_bambu_tag_;
+  unlock_state();
+
+  std::ostringstream body;
+  body << "{";
+  body << "\"material\":" << json_string(tag.valid && !tag.material.empty()
+                                          ? tag.material : std::string("PLA"));
+  if (tag.valid) {
+    if (!tag.subtype.empty()) body << ",\"subtype\":" << json_string(tag.subtype);
+    // rgba is validated as exactly 8 hex chars server-side; skip it otherwise
+    // so one malformed field cannot reject the whole spool.
+    if (tag.rgba.size() == 8) body << ",\"rgba\":" << json_string(tag.rgba);
+    if (tag.nozzle_min > 0) body << ",\"nozzle_temp_min\":" << tag.nozzle_min;
+    if (tag.nozzle_max > 0) body << ",\"nozzle_temp_max\":" << tag.nozzle_max;
+    body << ",\"brand\":\"Bambu Lab\"";
+  }
+  body << ",\"label_weight\":"
+       << (tag.valid && tag.label_weight > 0 ? tag.label_weight : 1000);
+
   if (spoolman_inventory_) {
     // Spoolman's create-spool body has no tag field, so create first, then
     // PATCH .../tag on the new spool to link it (two sequential blocking
     // calls on the HTTP task — same pattern used elsewhere for chained jobs).
-    std::string create_js = "{\"material\":\"PLA\",\"label_weight\":1000,"
-                             "\"note\":\"Created by ESPoolBuddy\"}";
-    ok = http_post_api("/spoolman/inventory/spools", create_js, resp);
+    body << ",\"note\":\"Created by ESPoolBuddy\"}";
+    ok = http_post_api("/spoolman/inventory/spools", body.str(), resp);
   } else {
-    std::string js = "{\"material\":\"PLA\",\"label_weight\":1000,"
-                     "\"tag_uid\":" + json_string(uid) + ","
-                     "\"note\":\"Created by ESPoolBuddy\","
-                     "\"data_origin\":\"spoolbuddy\"}";
-    ok = http_post_api("/inventory/spools", js, resp);
+    body << ",\"tag_uid\":" << json_string(uid);
+    // tray_uuid is Bambuddy's *primary* match key and the value the printer
+    // reports over MQTT. Omitting it (as this call used to) is why a spool
+    // registered from a scan only ever matched the one tag it was created
+    // from — a Bambu spool carries two, and both share this UID.
+    if (tag.valid && !tag.tray_uuid.empty())
+      body << ",\"tray_uuid\":" << json_string(tag.tray_uuid);
+    body << ",\"note\":\"Created by ESPoolBuddy\","
+         << "\"data_origin\":\"spoolbuddy\"}";
+    ok = http_post_api("/inventory/spools", body.str(), resp);
   }
   if (!ok) {
     ESP_LOGW(TAG, "api_create_spool_from_tag: failed");

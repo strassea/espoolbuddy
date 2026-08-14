@@ -473,6 +473,63 @@ bool BambuddyNFCComponent::ntag_write_page(uint8_t target_num, uint8_t page,
 // UUID extraction (matches the Python daemon's tray-UUID extraction)
 // ============================================================================
 
+bambuddy_api::BambuTagInfo BambuddyNFCComponent::parse_bambu_tag(
+    const std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> &blocks) {
+  bambuddy_api::BambuTagInfo info;
+  const uint8_t *b2 = nullptr, *b4 = nullptr, *b5 = nullptr, *b6 = nullptr;
+  for (const auto &b : blocks) {
+    if (b.first == 2) b2 = b.second.data();
+    if (b.first == 4) b4 = b.second.data();
+    if (b.first == 5) b5 = b.second.data();
+    if (b.first == 6) b6 = b.second.data();
+  }
+
+  // Blocks 2 and 4 are fixed-width, NUL-padded ASCII.
+  auto ascii16 = [](const uint8_t *p) {
+    std::string out;
+    for (int i = 0; i < 16 && p[i] != 0x00; i++) {
+      char c = (char) p[i];
+      if (c >= 0x20 && c < 0x7F) out += c;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+  };
+
+  if (b2 != nullptr) info.material = ascii16(b2);
+  if (b4 != nullptr) {
+    // Block 4 is the full product name ("PLA Basic"). Bambuddy stores material
+    // and subtype separately and splits on the same rule, so match it: drop the
+    // leading material word when it repeats, otherwise keep the whole string as
+    // the material (e.g. "PETG-HF", which has no separate subtype).
+    std::string detailed = ascii16(b4);
+    if (!detailed.empty()) {
+      size_t sp = detailed.find(' ');
+      if (sp != std::string::npos && !info.material.empty() &&
+          detailed.compare(0, sp, info.material) == 0) {
+        info.subtype = detailed.substr(sp + 1);
+      } else if (info.material.empty() || detailed != info.material) {
+        info.material = detailed;
+      }
+    }
+  }
+  if (b5 != nullptr) {
+    char rgba[9];
+    for (int i = 0; i < 4; i++) snprintf(rgba + i * 2, 3, "%02X", b5[i]);
+    info.rgba.assign(rgba, 8);
+    info.label_weight = (int) ((uint16_t) b5[4] | ((uint16_t) b5[5] << 8));
+  }
+  if (b6 != nullptr) {
+    // uint16 LE: hotend max at bytes 8-9, min at 10-11.
+    info.nozzle_max = (int) ((uint16_t) b6[8] | ((uint16_t) b6[9] << 8));
+    info.nozzle_min = (int) ((uint16_t) b6[10] | ((uint16_t) b6[11] << 8));
+    if (info.nozzle_max > 500 || info.nozzle_min > 500) {
+      info.nozzle_max = info.nozzle_min = 0;  // implausible → treat as absent
+    }
+  }
+  info.valid = !info.material.empty();
+  return info;
+}
+
 std::string BambuddyNFCComponent::extract_tray_uuid(
     const std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> &blocks) {
   const uint8_t *blk4 = nullptr;
@@ -927,6 +984,20 @@ void BambuddyNFCComponent::poll_once() {
         std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> blocks;
         if (read_bambu_blocks(1, uid, blocks)) {
           tray_uuid = extract_tray_uuid(blocks);
+          // Hand the decoded filament data over *before* on_tag_scanned(), so
+          // a Confirm that registers this tag has it available.
+          if (api_) {
+            auto info = parse_bambu_tag(blocks);
+            info.tray_uuid = tray_uuid;
+            if (info.valid) {
+              ESP_LOGI(NFC_TAG,
+                       "Bambu tag: material=%s subtype=%s rgba=%s %dg %d-%dC",
+                       info.material.c_str(), info.subtype.c_str(),
+                       info.rgba.c_str(), info.label_weight,
+                       info.nozzle_min, info.nozzle_max);
+            }
+            api_->set_bambu_tag_info(info);
+          }
         }
       }
 
