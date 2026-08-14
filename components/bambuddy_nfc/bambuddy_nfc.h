@@ -53,8 +53,19 @@ static const uint8_t BAMBU_MASTER_KEY[16] = {
 static const uint8_t BAMBU_CONTEXT[7] = {
     'R', 'F', 'I', 'D', '-', 'A', 0x00
 };
-// Bambu blocks to read for tray_uuid / material info
+// Bambu blocks to read for material info.
+//   1 = Tray Info Index (material variant id + material id)
+//   2 = Filament Type ("PLA")
+//   4 = Detailed Filament Type ("PLA Basic")
+//   5 = RGBA colour + spool weight + filament diameter
 static const uint8_t BAMBU_BLOCKS[] = {1, 2, 4, 5};
+
+// Block 9 holds the 16-byte Tray UID — the value Bambu printers report as
+// tray_uuid and the only field on the tag that uniquely identifies a spool.
+// Read separately from BAMBU_BLOCKS because it lives in sector 2: a tag that
+// refuses that sector must still yield the material info above rather than
+// failing the whole read.
+static constexpr uint8_t BAMBU_TRAY_UID_BLOCK = 9;
 
 enum class NFCState {
   IDLE,

@@ -416,6 +416,40 @@ bool BambuddyNFCComponent::read_bambu_blocks(
     memcpy(arr.data(), data, 16);
     blocks_out.push_back({block, arr});
   }
+
+  // Tray UID (block 9, sector 2). Best-effort: a tag that will not give up
+  // this sector should still return the material info gathered above, so a
+  // failure here logs and continues rather than failing the whole read.
+  {
+    const uint8_t block = BAMBU_TRAY_UID_BLOCK;
+    const int sector = block / 4;
+    const uint8_t *key = okm + sector * 6;
+    uint8_t data[16];
+    if (mfc_authenticate(target_num, block, key, uid.data()) &&
+        mfc_read_block(target_num, block, data)) {
+      std::array<uint8_t, 16> arr;
+      memcpy(arr.data(), data, 16);
+      blocks_out.push_back({block, arr});
+    } else {
+      ESP_LOGW(NFC_TAG, "Tray UID block %d unreadable — tray_uuid will fall "
+                        "back to material bytes", block);
+    }
+  }
+
+  // Raw dump of everything read. Bambu block semantics are community-derived,
+  // so when a tag behaves unexpectedly this is the only way to check the
+  // mapping against the actual bytes instead of trusting the parse.
+  for (const auto &b : blocks_out) {
+    char hex[33];
+    char ascii[17];
+    for (int i = 0; i < 16; i++) {
+      snprintf(hex + i * 2, 3, "%02X", b.second[i]);
+      char c = (char) b.second[i];
+      ascii[i] = (c >= 0x20 && c < 0x7F) ? c : '.';
+    }
+    ascii[16] = '\0';
+    ESP_LOGI(NFC_TAG, "  block %2d: %s  |%s|", b.first, hex, ascii);
+  }
   return true;
 }
 
@@ -443,10 +477,52 @@ std::string BambuddyNFCComponent::extract_tray_uuid(
     const std::vector<std::pair<uint8_t, std::array<uint8_t, 16>>> &blocks) {
   const uint8_t *blk4 = nullptr;
   const uint8_t *blk5 = nullptr;
+  const uint8_t *blk9 = nullptr;
   for (const auto &b : blocks) {
     if (b.first == 4) blk4 = b.second.data();
     if (b.first == 5) blk5 = b.second.data();
+    if (b.first == BAMBU_TRAY_UID_BLOCK) blk9 = b.second.data();
   }
+
+  // Block 9 is the Tray UID: the only field on the tag that identifies a
+  // *spool*. Everything else — including blocks 4 and 5 below — describes the
+  // filament, so it is identical across every spool of the same product.
+  //
+  // Getting this wrong is not a subtle failure. Deriving tray_uuid from block 4
+  // makes every "PLA Basic" spool report the same identifier (the ASCII of the
+  // name, hex-encoded), which is what the fallback path below silently did:
+  // "PLA Basic" contains only 4 hex-range characters, far short of the 32 the
+  // preferred path needs, so it always fell through.
+  if (blk9 != nullptr) {
+    bool all_zero = true;
+    for (int i = 0; i < 16; i++) {
+      if (blk9[i] != 0) { all_zero = false; break; }
+    }
+    if (!all_zero) {
+      // Stored either as 16 ASCII hex characters or as 16 raw bytes. Accept
+      // the ASCII form as-is; hex-encode otherwise. Both yield the 32-character
+      // identifier Bambu printers report as tray_uuid.
+      bool ascii_hex = true;
+      for (int i = 0; i < 16; i++) {
+        char c = (char) blk9[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) { ascii_hex = false; break; }
+      }
+      std::string uuid;
+      if (ascii_hex) {
+        uuid.assign((const char *) blk9, 16);
+      } else {
+        char buf[33];
+        for (int i = 0; i < 16; i++) snprintf(buf + i * 2, 3, "%02X", blk9[i]);
+        uuid.assign(buf, 32);
+      }
+      for (char &ch : uuid) {
+        if (ch >= 'a' && ch <= 'f') ch -= 32;
+      }
+      return uuid;
+    }
+  }
+
   if (!blk4 || !blk5) return "";
 
   // Combine blocks 4+5 (32 bytes)
